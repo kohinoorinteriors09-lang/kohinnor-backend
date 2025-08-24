@@ -15,8 +15,8 @@ app.use(express.static('public'));
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
+    user: "kohinoorinteriors09@gmail.com",
+    pass: "utzv hlvh xonq dvbl"
   },
   // Add these options for better compatibility
   secure: false,
@@ -68,8 +68,8 @@ ${message}
     `;
 
     const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: process.env.EMAIL_USER, // Send to yourself
+      from: "kohinoorinteriors09@gmail.com",
+      to: "kohinoorinteriors09@gmail.com", // Send to yourself
       replyTo: email, // Reply-to set to customer's email
       subject: subject,
       text: textContent,
@@ -116,7 +116,7 @@ app.post('/send-email', async (req, res) => {
     }
 
     const mailOptions = {
-      from: process.env.EMAIL_USER,
+      from: "kohinoorinteriors09@gmail.com",
       to: to,
       subject: subject,
       text: text,
