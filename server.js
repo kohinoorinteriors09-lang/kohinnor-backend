@@ -39,7 +39,7 @@ app.use(express.json());
 // Static files should come after API routes to avoid conflicts
 // app.use(express.static('public'));
 
-// Email configuration with improved timeout and connection settings
+// Email configuration with improved timeout and connection settings for Render
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   host: 'smtp.gmail.com',
@@ -49,18 +49,16 @@ const transporter = nodemailer.createTransport({
     user: "kohinoorinteriors09@gmail.com",
     pass: "utzv hlvh xonq dvbl"
   },
-  // Connection timeout settings
-  connectionTimeout: 10000, // 10 seconds
-  greetingTimeout: 10000,
-  socketTimeout: 10000,
+  // Increased connection timeout settings for Render network delays
+  connectionTimeout: 60000, // 60 seconds - accounts for Render spin-up
+  greetingTimeout: 30000, // 30 seconds
+  socketTimeout: 60000, // 60 seconds
   // Retry settings
-  pool: true,
-  maxConnections: 1,
-  maxMessages: 3,
+  pool: false, // Disable pooling for better reliability on Render
   // TLS options
   tls: {
     rejectUnauthorized: false,
-    ciphers: 'SSLv3'
+    minVersion: 'TLSv1.2'
   },
   // Debug (set to false in production)
   debug: process.env.NODE_ENV === 'development',
@@ -77,13 +75,15 @@ app.get('/', (req, res) => {
 const retryWithBackoff = async (fn, maxRetries = 3, initialDelay = 2000) => {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      return await fn();
+      // Pass attempt number to function so it can try different configurations
+      return await fn(attempt);
     } catch (error) {
       const isLastAttempt = attempt === maxRetries;
       const isTimeoutError = error.code === 'ETIMEDOUT' || 
                             error.message?.includes('timeout') ||
                             error.code === 'ECONNREFUSED' ||
-                            error.code === 'ETIMEDOUT';
+                            error.command === 'CONN' ||
+                            (error.code && error.code.includes('TIMEOUT'));
       
       if (isLastAttempt || !isTimeoutError) {
         throw error;
@@ -93,7 +93,7 @@ const retryWithBackoff = async (fn, maxRetries = 3, initialDelay = 2000) => {
       // This accounts for the 50+ second spin-up time on Render free tier
       const delays = [2000, 10000, 30000];
       const delay = delays[attempt - 1] || initialDelay * Math.pow(2, attempt - 1);
-      console.log(`Attempt ${attempt}/${maxRetries} failed (${error.code || error.message}), retrying in ${delay/1000}s...`);
+      console.log(`Attempt ${attempt}/${maxRetries} failed (${error.code || error.message || 'CONN timeout'}), retrying in ${delay/1000}s...`);
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -149,21 +149,54 @@ ${message}
       html: htmlContent
     };
 
-    // Add timeout wrapper for email sending (increased timeout for Render spin-up)
-    const sendEmailWithTimeout = (transporter, mailOptions, timeout = 60000) => {
+    // Add timeout wrapper for email sending (increased timeout for Render spin-up and SMTP connection)
+    const sendEmailWithTimeout = (transporter, mailOptions, timeout = 90000) => {
       return Promise.race([
         transporter.sendMail(mailOptions),
         new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Email sending timeout - server may be experiencing connectivity issues')), timeout)
+          setTimeout(() => {
+            const error = new Error('Email sending timeout - server may be experiencing connectivity issues');
+            error.code = 'ETIMEDOUT';
+            error.command = 'CONN';
+            reject(error);
+          }, timeout)
         )
       ]);
     };
 
     // Retry email sending with exponential backoff to handle Render free tier spin-down
-    const sendEmail = async () => {
-      // Skip verification on retries to speed up the process
-      // The actual sendMail will establish the connection
-      return await sendEmailWithTimeout(transporter, mailOptions);
+    // Try different ports/configurations on retry
+    const sendEmail = async (attempt = 1) => {
+      // Try port 465 (SSL) on later attempts if 587 (TLS) fails
+      const useSSL = attempt >= 2;
+      const port = useSSL ? 465 : 587;
+      
+      const retryTransporter = nodemailer.createTransport({
+        service: 'gmail',
+        host: 'smtp.gmail.com',
+        port: port,
+        secure: useSSL, // true for 465, false for 587
+        auth: {
+          user: "kohinoorinteriors09@gmail.com",
+          pass: "utzv hlvh xonq dvbl"
+        },
+        connectionTimeout: 60000,
+        greetingTimeout: 30000,
+        socketTimeout: 60000,
+        pool: false,
+        tls: {
+          rejectUnauthorized: false,
+          minVersion: 'TLSv1.2'
+        }
+      });
+      
+      try {
+        console.log(`Attempting to send email via ${useSSL ? 'SSL (465)' : 'TLS (587)'}...`);
+        return await sendEmailWithTimeout(retryTransporter, mailOptions);
+      } finally {
+        // Close the transporter to free resources
+        retryTransporter.close();
+      }
     };
 
     // Retry up to 3 times with increasing delays (2s, 10s, 30s) to handle Render's 50+ second spin-up
