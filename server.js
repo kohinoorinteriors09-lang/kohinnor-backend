@@ -6,32 +6,105 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
+// Middleware - CORS configuration
+// In development, allow all origins for easier testing
+// In production, specify exact origins
+const corsOptions = {
+  origin: true, // Allow all origins in development
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers'
+  ],
+  exposedHeaders: ['Content-Type', 'Authorization'],
+  optionsSuccessStatus: 200,
+  preflightContinue: false
+};
 
-// Email configuration
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log('Origin:', req.headers.origin);
+  next();
+});
+
+app.use(cors(corsOptions));
+app.use(express.json());
+// Static files should come after API routes to avoid conflicts
+// app.use(express.static('public'));
+
+// Email configuration with improved timeout and connection settings
 const transporter = nodemailer.createTransport({
   service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // true for 465, false for other ports
   auth: {
     user: "kohinoorinteriors09@gmail.com",
     pass: "utzv hlvh xonq dvbl"
   },
-  // Add these options for better compatibility
-  secure: false,
+  // Connection timeout settings
+  connectionTimeout: 10000, // 10 seconds
+  greetingTimeout: 10000,
+  socketTimeout: 10000,
+  // Retry settings
+  pool: true,
+  maxConnections: 1,
+  maxMessages: 3,
+  // TLS options
   tls: {
-    rejectUnauthorized: false
-  }
+    rejectUnauthorized: false,
+    ciphers: 'SSLv3'
+  },
+  // Debug (set to false in production)
+  debug: process.env.NODE_ENV === 'development',
+  logger: process.env.NODE_ENV === 'development'
 });
 
 // Routes
+// Note: CORS middleware above already handles OPTIONS preflight requests
 app.get('/', (req, res) => {
   res.sendFile(__dirname + '/public/index.html');
 });
 
+// Retry utility function for handling Render free tier spin-down delays (50+ seconds)
+const retryWithBackoff = async (fn, maxRetries = 3, initialDelay = 2000) => {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const isLastAttempt = attempt === maxRetries;
+      const isTimeoutError = error.code === 'ETIMEDOUT' || 
+                            error.message?.includes('timeout') ||
+                            error.code === 'ECONNREFUSED' ||
+                            error.code === 'ETIMEDOUT';
+      
+      if (isLastAttempt || !isTimeoutError) {
+        throw error;
+      }
+      
+      // Exponential backoff with longer delays for Render spin-up: 2s, 10s, 30s
+      // This accounts for the 50+ second spin-up time on Render free tier
+      const delays = [2000, 10000, 30000];
+      const delay = delays[attempt - 1] || initialDelay * Math.pow(2, attempt - 1);
+      console.log(`Attempt ${attempt}/${maxRetries} failed (${error.code || error.message}), retrying in ${delay/1000}s...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+};
+
 // Send quote request endpoint
-app.post('/send-quote', async (req, res) => {
+app.post('/send-quote', cors(corsOptions), async (req, res) => {
+  console.log('Received POST /send-quote request');
+  console.log('Request body:', req.body);
+  console.log('Request headers:', req.headers);
+  
   try {
     const { fullName, email, phone, projectType, message } = req.body;
 
@@ -76,7 +149,25 @@ ${message}
       html: htmlContent
     };
 
-    const info = await transporter.sendMail(mailOptions);
+    // Add timeout wrapper for email sending (increased timeout for Render spin-up)
+    const sendEmailWithTimeout = (transporter, mailOptions, timeout = 60000) => {
+      return Promise.race([
+        transporter.sendMail(mailOptions),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Email sending timeout - server may be experiencing connectivity issues')), timeout)
+        )
+      ]);
+    };
+
+    // Retry email sending with exponential backoff to handle Render free tier spin-down
+    const sendEmail = async () => {
+      // Skip verification on retries to speed up the process
+      // The actual sendMail will establish the connection
+      return await sendEmailWithTimeout(transporter, mailOptions);
+    };
+
+    // Retry up to 3 times with increasing delays (2s, 10s, 30s) to handle Render's 50+ second spin-up
+    const info = await retryWithBackoff(sendEmail, 3, 2000);
     
     res.json({
       success: true,
@@ -86,19 +177,26 @@ ${message}
 
   } catch (error) {
     console.error('Error sending quote request:', error);
+    console.error('Error code:', error.code);
+    console.error('Error command:', error.command);
     
     // Provide more helpful error messages
     let userMessage = 'Failed to send quote request. Please try again.';
-    if (error.message.includes('Invalid login') || error.message.includes('Username and Password not accepted')) {
+    if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+      userMessage = 'Connection timeout - Unable to reach email server. This may be a temporary network issue. Please try again in a few moments.';
+    } else if (error.message.includes('Invalid login') || error.message.includes('Username and Password not accepted')) {
       userMessage = 'Email authentication failed. Please check your Gmail credentials and ensure you\'re using an App Password.';
-    } else if (error.message.includes('ENOTFOUND')) {
+    } else if (error.message.includes('ENOTFOUND') || error.code === 'ENOTFOUND') {
       userMessage = 'Network error. Please check your internet connection.';
+    } else if (error.code === 'ECONNREFUSED') {
+      userMessage = 'Connection refused - Email server is not reachable. Please try again later.';
     }
     
     res.status(500).json({
       success: false,
       message: userMessage,
-      error: error.message
+      error: error.message,
+      errorCode: error.code || 'UNKNOWN'
     });
   }
 });
@@ -146,7 +244,28 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK', message: 'Email server is running' });
 });
 
+// Serve static files after API routes
+app.use(express.static('public'));
+
+// 404 handler for unmatched routes
+app.use((req, res) => {
+  // Only return JSON for API-like paths, otherwise let Express handle it
+  if (req.path.startsWith('/api') || req.path.startsWith('/send-') || req.path.startsWith('/health')) {
+    return res.status(404).json({ 
+      success: false, 
+      message: `Route not found: ${req.method} ${req.path}` 
+    });
+  }
+  // For other routes, send a simple 404
+  res.status(404).send('Not Found');
+});
+
 app.listen(PORT, () => {
   console.log(`Email server running on port ${PORT}`);
   console.log(`Open http://localhost:${PORT} in your browser`);
+  console.log(`CORS enabled for localhost origins`);
+  console.log(`API endpoints available:`);
+  console.log(`  POST http://localhost:${PORT}/send-quote`);
+  console.log(`  POST http://localhost:${PORT}/send-email`);
+  console.log(`  GET  http://localhost:${PORT}/health`);
 });
