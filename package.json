@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon server.js",
+    "start": "node --max-old-space-size=4096 index.js",
+    "dev": "nodemon --exec \"node --max-old-space-size=4096\" server.js",
     "test-gmail": "node test-gmail.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

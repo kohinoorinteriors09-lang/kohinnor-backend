@@ -27,19 +27,25 @@ const corsOptions = {
   preflightContinue: false
 };
 
-// Request logging middleware
+// Request logging middleware (optimized to prevent memory issues)
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  console.log('Origin:', req.headers.origin);
+  // Only log in development to reduce memory usage in production
+  if (process.env.NODE_ENV === 'development') {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+    console.log('Origin:', req.headers.origin);
+  }
   next();
 });
 
 app.use(cors(corsOptions));
-app.use(express.json());
+// Add body size limits to prevent memory issues
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Static files should come after API routes to avoid conflicts
 // app.use(express.static('public'));
 
 // Email configuration with improved timeout and connection settings for Render
+// Using pool: false to prevent memory leaks and connection issues
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   host: 'smtp.gmail.com',
@@ -53,8 +59,8 @@ const transporter = nodemailer.createTransport({
   connectionTimeout: 60000, // 60 seconds - accounts for Render spin-up
   greetingTimeout: 30000, // 30 seconds
   socketTimeout: 60000, // 60 seconds
-  // Retry settings
-  pool: false, // Disable pooling for better reliability on Render
+  // Retry settings - pool disabled to prevent memory leaks
+  pool: false, // Disable pooling for better reliability on Render and to prevent memory issues
   // TLS options
   tls: {
     rejectUnauthorized: false,
@@ -64,6 +70,19 @@ const transporter = nodemailer.createTransport({
   debug: process.env.NODE_ENV === 'development',
   logger: process.env.NODE_ENV === 'development'
 });
+
+// Add memory monitoring (optional, for debugging)
+if (process.env.NODE_ENV === 'development') {
+  setInterval(() => {
+    const used = process.memoryUsage();
+    console.log('Memory Usage:', {
+      rss: `${Math.round(used.rss / 1024 / 1024 * 100) / 100} MB`,
+      heapTotal: `${Math.round(used.heapTotal / 1024 / 1024 * 100) / 100} MB`,
+      heapUsed: `${Math.round(used.heapUsed / 1024 / 1024 * 100) / 100} MB`,
+      external: `${Math.round(used.external / 1024 / 1024 * 100) / 100} MB`
+    });
+  }, 30000); // Log every 30 seconds in development
+}
 
 // Routes
 // Note: CORS middleware above already handles OPTIONS preflight requests
@@ -171,31 +190,40 @@ ${message}
       const useSSL = attempt >= 2;
       const port = useSSL ? 465 : 587;
       
-      const retryTransporter = nodemailer.createTransport({
-        service: 'gmail',
-        host: 'smtp.gmail.com',
-        port: port,
-        secure: useSSL, // true for 465, false for 587
-        auth: {
-          user: "kohinoorinteriors09@gmail.com",
-          pass: "utzv hlvh xonq dvbl"
-        },
-        connectionTimeout: 60000,
-        greetingTimeout: 30000,
-        socketTimeout: 60000,
-        pool: false,
-        tls: {
-          rejectUnauthorized: false,
-          minVersion: 'TLSv1.2'
-        }
-      });
-      
+      let retryTransporter = null;
       try {
+        retryTransporter = nodemailer.createTransport({
+          service: 'gmail',
+          host: 'smtp.gmail.com',
+          port: port,
+          secure: useSSL, // true for 465, false for 587
+          auth: {
+            user: "kohinoorinteriors09@gmail.com",
+            pass: "utzv hlvh xonq dvbl"
+          },
+          connectionTimeout: 60000,
+          greetingTimeout: 30000,
+          socketTimeout: 60000,
+          pool: false, // Disable pooling to prevent memory leaks
+          tls: {
+            rejectUnauthorized: false,
+            minVersion: 'TLSv1.2'
+          }
+        });
+        
         console.log(`Attempting to send email via ${useSSL ? 'SSL (465)' : 'TLS (587)'}...`);
-        return await sendEmailWithTimeout(retryTransporter, mailOptions);
+        const result = await sendEmailWithTimeout(retryTransporter, mailOptions);
+        return result;
       } finally {
-        // Close the transporter to free resources
-        retryTransporter.close();
+        // Properly close and cleanup transporter to free memory
+        if (retryTransporter) {
+          try {
+            retryTransporter.close();
+          } catch (closeError) {
+            console.warn('Error closing transporter:', closeError.message);
+          }
+          retryTransporter = null;
+        }
       }
     };
 
